@@ -104,14 +104,29 @@ function getBvid(value) {
   return match[0];
 }
 
-async function api(path, params = {}, init = {}) {
+function biliHeaders(env, extra = {}) {
+  const headers = {
+    "user-agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/131.0.0.0 Safari/537.36",
+    accept: "application/json, text/plain, */*",
+    "accept-language": "zh-CN,zh;q=0.9,en;q=0.8",
+    referer: "https://www.bilibili.com/",
+    origin: "https://www.bilibili.com",
+    ...extra
+  };
+  if (env?.BILI_SESSDATA) {
+    headers.cookie = `SESSDATA=${env.BILI_SESSDATA}${env.BILI_CSRF ? `; bili_jct=${env.BILI_CSRF}` : ""}`;
+  }
+  return headers;
+}
+
+async function api(path, params = {}, init = {}, env = {}) {
   const url = new URL(`https://api.bilibili.com${path}`);
   for (const [key, value] of Object.entries(params)) {
     if (value !== undefined && value !== null && value !== "") url.searchParams.set(key, String(value));
   }
   const response = await fetch(url, {
     ...init,
-    headers: { "user-agent": "Mozilla/5.0", accept: "application/json", ...(init.headers || {}) }
+    headers: biliHeaders(env, init.headers || {})
   });
   if (!response.ok) throw new Error(`B 站 HTTP ${response.status}`);
   const data = await response.json();
@@ -119,45 +134,44 @@ async function api(path, params = {}, init = {}) {
   return data.data;
 }
 
-async function videoInfo(input) {
+async function videoInfo(input, env) {
   const bvid = getBvid(input);
-  return api("/x/web-interface/view", { bvid });
+  return api("/x/web-interface/view", { bvid }, {}, env);
 }
 
 function cookieHeaders(env) {
   if (!env.BILI_SESSDATA || !env.BILI_CSRF) {
     throw new Error("尚未配置 BILI_SESSDATA 和 BILI_CSRF 两个 Cloudflare Secret");
   }
-  return {
-    cookie: `SESSDATA=${env.BILI_SESSDATA}; bili_jct=${env.BILI_CSRF}`,
-    referer: "https://www.bilibili.com/"
-  };
+  return biliHeaders(env, {
+    cookie: `SESSDATA=${env.BILI_SESSDATA}; bili_jct=${env.BILI_CSRF}`
+  });
 }
 
 async function authApi(path, params, env, method = "GET") {
   const headers = cookieHeaders(env);
-  if (method === "GET") return api(path, params, { headers });
+  if (method === "GET") return api(path, params, { headers }, env);
   const body = new URLSearchParams(params);
-  return api(path, {}, { method: "POST", headers: { ...headers, "content-type": "application/x-www-form-urlencoded" }, body });
+  return api(path, {}, { method: "POST", headers: { ...headers, "content-type": "application/x-www-form-urlencoded" }, body }, env);
 }
 
-async function subtitles(input) {
-  const info = await videoInfo(input);
+async function subtitles(input, env) {
+  const info = await videoInfo(input, env);
   const list = info.subtitle?.list || [];
   if (!list.length) return { bvid: info.bvid, message: "这个视频没有可用字幕。" };
   const result = [];
   for (const item of list.slice(0, 3)) {
     const subtitleUrl = item.subtitle_url.startsWith("//") ? `https:${item.subtitle_url}` : item.subtitle_url;
-    const response = await fetch(subtitleUrl);
+    const response = await fetch(subtitleUrl, { headers: biliHeaders(env) });
     const data = await response.json();
     result.push({ lan: item.lan, lan_doc: item.lan_doc, text: (data.body || []).map(x => ({ from: x.from, to: x.to, content: x.content })) });
   }
   return { bvid: info.bvid, subtitles: result };
 }
 
-async function danmaku(input, limit = 100) {
-  const info = await videoInfo(input);
-  const response = await fetch(`https://api.bilibili.com/x/v1/dm/list.so?oid=${info.cid}`);
+async function danmaku(input, limit = 100, env) {
+  const info = await videoInfo(input, env);
+  const response = await fetch(`https://api.bilibili.com/x/v1/dm/list.so?oid=${info.cid}`, { headers: biliHeaders(env) });
   const xml = await response.text();
   const messages = [...xml.matchAll(/<d p="([^"]*)">([\s\S]*?)<\/d>/g)].map(match => {
     const parts = match[1].split(",");
@@ -166,9 +180,9 @@ async function danmaku(input, limit = 100) {
   return { bvid: info.bvid, count: messages.length, danmaku: messages.slice(0, Math.min(Math.max(Number(limit) || 100, 1), 300)) };
 }
 
-async function comments(input, page = 1) {
-  const info = await videoInfo(input);
-  const data = await api("/x/v2/reply", { type: 1, oid: info.aid, pn: Math.max(Number(page) || 1, 1), ps: 20, sort: 2 });
+async function comments(input, page = 1, env) {
+  const info = await videoInfo(input, env);
+  const data = await api("/x/v2/reply", { type: 1, oid: info.aid, pn: Math.max(Number(page) || 1, 1), ps: 20, sort: 2 }, {}, env);
   return {
     bvid: info.bvid,
     page: Number(page) || 1,
@@ -194,7 +208,7 @@ async function createFolder(args, env) {
 }
 
 async function saveVideo(args, env) {
-  const info = await videoInfo(args.url);
+  const info = await videoInfo(args.url, env);
   const data = await authApi("/x/v3/fav/resource/deal", {
     rid: info.aid,
     type: 2,
@@ -208,10 +222,10 @@ async function saveVideo(args, env) {
 
 async function callTool(name, args, env) {
   switch (name) {
-    case "get_video_info": return await videoInfo(args.url);
-    case "get_subtitles": return await subtitles(args.url);
-    case "get_danmaku": return await danmaku(args.url, args.limit);
-    case "get_comments": return await comments(args.url, args.page);
+    case "get_video_info": return await videoInfo(args.url, env);
+    case "get_subtitles": return await subtitles(args.url, env);
+    case "get_danmaku": return await danmaku(args.url, args.limit, env);
+    case "get_comments": return await comments(args.url, args.page, env);
     case "list_favorite_folders": return await listFolders(env);
     case "create_favorite_folder": return await createFolder(args, env);
     case "save_video_to_folder": return await saveVideo(args, env);
